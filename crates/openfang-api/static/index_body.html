@@ -1,12 +1,26 @@
 <body x-data="app" :data-theme="theme">
 
-<!-- API Key Auth Prompt -->
-<div x-show="$store.app.showAuthPrompt" style="position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px)" x-data="{ apiKeyInput: '' }">
+<!-- Auth Login Prompt — supports both API token and password login -->
+<div x-show="$store.app.showAuthPrompt" style="position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px)" x-data="{ authTab: 'token', apiKeyInput: '', passwordInput: '', loginError: '', logging: false }">
   <div style="background:var(--bg-card,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:2rem;max-width:400px;width:90%">
-    <h3 style="margin:0 0 0.5rem;font-size:1.1rem">API Key Required</h3>
-    <p style="color:var(--text-dim,#888);font-size:0.85rem;margin:0 0 1rem">This instance requires an API key. Enter the key from your <code>config.toml</code>.</p>
-    <input type="password" x-model="apiKeyInput" placeholder="Enter API key..." @keydown.enter="$store.app.submitApiKey(apiKeyInput)" style="width:100%;padding:0.6rem;border-radius:6px;border:1px solid var(--border,#333);background:var(--bg-input,#151520);color:var(--text,#e0e0e0);font-size:0.9rem;box-sizing:border-box;margin-bottom:0.75rem">
-    <button @click="$store.app.submitApiKey(apiKeyInput)" style="width:100%;padding:0.6rem;border-radius:6px;border:none;background:var(--accent,#7c3aed);color:#fff;font-weight:600;cursor:pointer;font-size:0.9rem">Unlock Dashboard</button>
+    <h3 style="margin:0 0 0.5rem;font-size:1.1rem">Authentication Required</h3>
+    <p style="color:var(--text-dim,#888);font-size:0.82rem;margin:0 0 1rem">This OpenFang instance requires authentication.</p>
+    <div style="display:flex;gap:2px;background:var(--bg-input,#151520);border-radius:6px;padding:2px;margin-bottom:1rem">
+      <button @click="authTab='token'; loginError=''" :style="authTab==='token' ? 'background:var(--accent,#7c3aed);color:#fff' : 'background:transparent;color:var(--text-dim,#888)'" style="flex:1;padding:0.45rem;border:none;cursor:pointer;font-size:0.82rem;font-weight:600;border-radius:4px">API Token</button>
+      <button @click="authTab='password'; loginError=''" :style="authTab==='password' ? 'background:var(--accent,#7c3aed);color:#fff' : 'background:transparent;color:var(--text-dim,#888)'" style="flex:1;padding:0.45rem;border:none;cursor:pointer;font-size:0.82rem;font-weight:600;border-radius:4px" x-show="$store.app.passwordLoginAvailable">Password</button>
+    </div>
+    <div x-show="authTab==='token'">
+      <input type="password" x-model="apiKeyInput" placeholder="Enter API token (of-...)..." @keydown.enter="$store.app.submitApiKey(apiKeyInput)" style="width:100%;padding:0.6rem;border-radius:6px;border:1px solid var(--border,#333);background:var(--bg-input,#151520);color:var(--text,#e0e0e0);font-size:0.9rem;box-sizing:border-box;margin-bottom:0.75rem">
+      <button @click="$store.app.submitApiKey(apiKeyInput)" style="width:100%;padding:0.6rem;border-radius:6px;border:none;background:var(--accent,#7c3aed);color:#fff;font-weight:600;cursor:pointer;font-size:0.9rem">Unlock Dashboard</button>
+      <p style="color:var(--text-dim,#666);font-size:0.75rem;margin:0.5rem 0 0;text-align:center">Token from <code>[auth]</code> section or <code>api_key</code> in config.toml</p>
+    </div>
+    <div x-show="authTab==='password'">
+      <input type="password" x-model="passwordInput" placeholder="Enter password..." @keydown.enter="$store.app.loginWithPassword(passwordInput, function(err){ loginError=err; })" style="width:100%;padding:0.6rem;border-radius:6px;border:1px solid var(--border,#333);background:var(--bg-input,#151520);color:var(--text,#e0e0e0);font-size:0.9rem;box-sizing:border-box;margin-bottom:0.75rem">
+      <div x-show="loginError" style="color:#f87171;font-size:0.82rem;margin-bottom:0.5rem" x-text="loginError"></div>
+      <button @click="logging=true; $store.app.loginWithPassword(passwordInput, function(err){ loginError=err; logging=false; })" :disabled="logging" style="width:100%;padding:0.6rem;border-radius:6px;border:none;background:var(--accent,#7c3aed);color:#fff;font-weight:600;cursor:pointer;font-size:0.9rem">
+        <span x-show="!logging">Sign In</span><span x-show="logging">Signing in...</span>
+      </button>
+    </div>
   </div>
 </div>
 

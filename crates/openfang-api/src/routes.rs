@@ -36,6 +36,10 @@ pub struct AppState {
     /// ClawHub response cache — prevents 429 rate limiting on rapid dashboard refreshes.
     /// Maps cache key → (fetched_at, response_json) with 120s TTL.
     pub clawhub_cache: DashMap<String, (Instant, serde_json::Value)>,
+    /// Session store for web auth password-based login.
+    pub session_store: Arc<crate::web_auth::SessionStore>,
+    /// Login brute-force rate limiter.
+    pub login_limiter: Arc<crate::web_auth::LoginRateLimiter>,
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -9934,4 +9938,267 @@ pub async fn comms_task(
             Json(serde_json::json!({"error": format!("Failed to post task: {e}")})),
         ),
     }
+}
+
+// ── Web Authentication Endpoints ──
+
+/// GET /api/auth/status — Full auth status with security recommendations.
+pub async fn auth_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let effective_mode = crate::web_auth::effective_auth_mode(
+        &state.kernel.config.auth,
+        &state.kernel.config.api_key,
+    );
+    let mut recommendations = Vec::new();
+    if effective_mode == openfang_types::config::WebAuthMode::None {
+        recommendations.push(serde_json::json!({
+            "severity": "critical",
+            "message": "No authentication configured. Only localhost access is allowed."
+        }));
+    }
+    if !state.kernel.config.api_key.is_empty() && state.kernel.config.auth.tokens.is_empty() {
+        recommendations.push(serde_json::json!({
+            "severity": "info",
+            "message": "Using legacy api_key. Consider migrating to [auth] section with named tokens."
+        }));
+    }
+    if !state.kernel.config.auth.allowed_origins.is_empty()
+        && !state.kernel.config.auth.trust_proxy_headers
+    {
+        recommendations.push(serde_json::json!({
+            "severity": "warning",
+            "message": "Remote origins configured but trust_proxy_headers is false."
+        }));
+    }
+    Json(serde_json::json!({
+        "mode": effective_mode.to_string(),
+        "token_count": state.kernel.config.auth.tokens.len(),
+        "password_set": !state.kernel.config.auth.password_hash.is_empty(),
+        "legacy_api_key_set": !state.kernel.config.api_key.is_empty(),
+        "protect_dashboard": state.kernel.config.auth.protect_dashboard,
+        "active_sessions": state.session_store.count(),
+        "allowed_origins": state.kernel.config.auth.allowed_origins,
+        "trust_proxy_headers": state.kernel.config.auth.trust_proxy_headers,
+        "secure_cookies": state.kernel.config.auth.secure_cookies,
+        "recommendations": recommendations
+    }))
+}
+
+/// GET /api/auth/mode — Minimal endpoint (always public).
+pub async fn auth_mode(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let effective_mode = crate::web_auth::effective_auth_mode(
+        &state.kernel.config.auth,
+        &state.kernel.config.api_key,
+    );
+    Json(serde_json::json!({
+        "mode": effective_mode.to_string(),
+        "password_login_available": !state.kernel.config.auth.password_hash.is_empty()
+            && matches!(
+                effective_mode,
+                openfang_types::config::WebAuthMode::Password
+                    | openfang_types::config::WebAuthMode::Full
+            )
+    }))
+}
+
+/// POST /api/auth/login — Password-based login. Returns a session cookie.
+pub async fn auth_login(
+    State(state): State<Arc<AppState>>,
+    request: axum::http::Request<axum::body::Body>,
+) -> impl IntoResponse {
+    let client_ip = crate::web_auth::extract_client_ip(
+        request.headers(),
+        request.extensions(),
+        state.kernel.config.auth.trust_proxy_headers,
+    );
+    let ip_str = client_ip.to_string();
+
+    if let Some(remaining) = state.login_limiter.is_locked_out(&ip_str) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": format!("Too many failed attempts. Try again in {remaining} seconds."),
+                "retry_after_secs": remaining
+            })),
+        )
+            .into_response();
+    }
+
+    let body_bytes = match axum::body::to_bytes(request.into_body(), 4096).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid request body"})),
+            )
+                .into_response();
+        }
+    };
+    let req: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid JSON"})),
+            )
+                .into_response();
+        }
+    };
+
+    let effective_mode = crate::web_auth::effective_auth_mode(
+        &state.kernel.config.auth,
+        &state.kernel.config.api_key,
+    );
+    if !matches!(
+        effective_mode,
+        openfang_types::config::WebAuthMode::Password
+            | openfang_types::config::WebAuthMode::Full
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Password login not enabled."})),
+        )
+            .into_response();
+    }
+
+    let password = req.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    if password.is_empty() || state.kernel.config.auth.password_hash.is_empty() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid credentials"})),
+        )
+            .into_response();
+    }
+
+    if !crate::web_auth::verify_password(password, &state.kernel.config.auth.password_hash) {
+        state.login_limiter.record_failure(&ip_str);
+        tracing::warn!(client_ip = %ip_str, "Failed password login attempt");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid password"})),
+        )
+            .into_response();
+    }
+
+    state.login_limiter.clear(&ip_str);
+    let session_id = state.session_store.create_session(&ip_str);
+
+    let mut cookie = format!(
+        "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
+        crate::web_auth::SESSION_COOKIE,
+        session_id,
+        state.kernel.config.auth.session_timeout_secs,
+    );
+    if state.kernel.config.auth.secure_cookies {
+        cookie.push_str("; Secure");
+    }
+
+    tracing::info!(client_ip = %ip_str, "Successful password login");
+    (
+        StatusCode::OK,
+        [("set-cookie", cookie)],
+        Json(serde_json::json!({"ok": true, "message": "Login successful"})),
+    )
+        .into_response()
+}
+
+/// POST /api/auth/logout — Destroy current session.
+pub async fn auth_logout(
+    State(state): State<Arc<AppState>>,
+    request: axum::http::Request<axum::body::Body>,
+) -> impl IntoResponse {
+    if let Some(session_id) = crate::web_auth::extract_session_cookie(request.headers()) {
+        state.session_store.remove(&session_id);
+    }
+    let clear_cookie = format!(
+        "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+        crate::web_auth::SESSION_COOKIE,
+    );
+    (
+        StatusCode::OK,
+        [("set-cookie", clear_cookie)],
+        Json(serde_json::json!({"ok": true, "message": "Logged out"})),
+    )
+}
+
+/// GET /api/auth/tokens — List configured tokens (redacted).
+pub async fn auth_list_tokens(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let tokens: Vec<serde_json::Value> = state
+        .kernel.config.auth.tokens.iter()
+        .map(|t| serde_json::json!({
+            "name": t.name,
+            "token_preview": crate::web_auth::mask_token(&t.token),
+            "created_at": t.created_at,
+        }))
+        .collect();
+    let legacy = if state.kernel.config.api_key.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({
+            "name": "legacy_api_key",
+            "token_preview": crate::web_auth::mask_token(&state.kernel.config.api_key),
+        }))
+    };
+    Json(serde_json::json!({"tokens": tokens, "legacy_api_key": legacy}))
+}
+
+/// POST /api/auth/tokens — Generate a new named token.
+pub async fn auth_create_token(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let name = req.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed").to_string();
+    let token = crate::web_auth::generate_api_token();
+    tracing::info!(token_name = %name, "New API token generated");
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "name": name,
+            "token": token,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "message": format!("Add to config.toml:\n\n[[auth.tokens]]\nname = \"{name}\"\ntoken = \"{token}\"")
+        })),
+    )
+}
+
+/// DELETE /api/auth/tokens/{name} — Revoke a named token.
+pub async fn auth_revoke_token(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let exists = state.kernel.config.auth.tokens.iter().any(|t| t.name == name);
+    if !exists {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Token '{name}' not found")})));
+    }
+    tracing::info!(token_name = %name, "API token revoke requested");
+    (StatusCode::OK, Json(serde_json::json!({"ok": true, "message": format!("Remove [[auth.tokens]] entry '{name}' from config.toml and reload.")})))
+}
+
+/// GET /api/auth/sessions — List active sessions.
+pub async fn auth_list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let sessions = state.session_store.active_sessions();
+    Json(serde_json::json!({"sessions": sessions, "total": sessions.len()}))
+}
+
+/// PUT /api/auth/password — Generate a password hash.
+pub async fn auth_set_password(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let password = req.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    if password.len() < 8 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Password must be at least 8 characters"})));
+    }
+    match crate::web_auth::hash_password(password) {
+        Ok(hash) => (StatusCode::OK, Json(serde_json::json!({
+            "ok": true,
+            "password_hash": hash,
+            "message": "Add to config.toml:\n\n[auth]\nmode = \"password\"\npassword_hash = \"<paste hash>\""
+        }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
+    }
+}
+
+/// GET /api/auth/check — Returns 200 if authenticated.
+pub async fn auth_check(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(serde_json::json!({"authenticated": true}))
 }

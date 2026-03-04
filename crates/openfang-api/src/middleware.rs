@@ -3,16 +3,32 @@
 //! Provides:
 //! - Request ID generation and propagation
 //! - Per-endpoint structured request logging
-//! - In-memory rate limiting (per IP)
+//! - Multi-method authentication (legacy api_key + new web auth tokens/sessions)
+//! - Security headers
 
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use axum::middleware::Next;
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
 
+use crate::web_auth::{self, SessionStore};
+use openfang_types::config::{WebAuthConfig, WebAuthMode};
+
 /// Request ID header name (standard).
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Shared auth state passed to the middleware.
+#[derive(Clone)]
+pub struct AuthState {
+    /// New multi-method auth configuration.
+    pub auth_config: WebAuthConfig,
+    /// Legacy single api_key (for backwards compatibility).
+    pub legacy_api_key: String,
+    /// Session store for password-based login.
+    pub session_store: Arc<SessionStore>,
+}
 
 /// Middleware: inject a unique request ID and log the request/response.
 pub async fn request_logging(request: Request<Body>, next: Next) -> Response<Body> {
@@ -43,59 +59,28 @@ pub async fn request_logging(request: Request<Body>, next: Next) -> Response<Bod
     response
 }
 
-/// Bearer token authentication middleware.
-///
-/// When `api_key` is non-empty, all requests must include
-/// `Authorization: Bearer <api_key>`. If the key is empty, auth is bypassed.
-pub async fn auth(
-    axum::extract::State(api_key): axum::extract::State<String>,
-    request: Request<Body>,
-    next: Next,
-) -> Response<Body> {
-    // If no API key configured, restrict to loopback addresses only.
-    if api_key.is_empty() {
-        let is_loopback = request
-            .extensions()
-            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-            .map(|ci| ci.0.ip().is_loopback())
-            .unwrap_or(false);
-
-        if !is_loopback {
-            tracing::warn!(
-                "Rejected non-localhost request: no API key configured. \
-                 Set api_key in config.toml for remote access."
-            );
-            return Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "error": "No API key configured. Remote access denied. Configure api_key in ~/.openfang/config.toml"
-                    })
-                    .to_string(),
-                ))
-                .unwrap_or_default();
-        }
-        return next.run(request).await;
-    }
-
-    // Public endpoints that don't require auth (dashboard needs these)
-    let path = request.uri().path();
-    if path == "/"
-        || path == "/logo.png"
+/// Endpoints that never require authentication.
+fn is_always_public(path: &str) -> bool {
+    path == "/logo.png"
         || path == "/favicon.ico"
         || path == "/.well-known/agent.json"
-        || path.starts_with("/a2a/")
         || path == "/api/health"
+        || path == "/api/version"
+        // Auth endpoints must be public so users can log in
+        || path == "/api/auth/login"
+        || path == "/api/auth/status"
+        || path == "/api/auth/mode"
+}
+
+/// Endpoints public when dashboard protection is disabled.
+fn is_dashboard_public(path: &str) -> bool {
+    path == "/"
         || path == "/api/health/detail"
         || path == "/api/status"
-        || path == "/api/version"
         || path == "/api/agents"
         || path == "/api/profiles"
         || path == "/api/config"
         || path.starts_with("/api/uploads/")
-        // Dashboard read endpoints — allow unauthenticated so the SPA can
-        // render before the user enters their API key.
         || path == "/api/models"
         || path == "/api/models/aliases"
         || path == "/api/providers"
@@ -119,67 +104,113 @@ pub async fn auth(
         || path == "/api/logs/stream"
         || path.starts_with("/api/cron/")
         || path.starts_with("/api/providers/github-copilot/oauth/")
-    {
+}
+
+/// A2A protocol endpoints are always public (they have their own auth).
+fn is_a2a_endpoint(path: &str) -> bool {
+    path.starts_with("/a2a/")
+}
+
+/// Multi-method authentication middleware.
+///
+/// Supports (in order of priority):
+/// 1. Legacy `api_key` from config (Bearer header, X-API-Key, ?token=)
+/// 2. New multi-token auth (from [auth] config section)
+/// 3. Session cookies (from password login)
+/// 4. Localhost-only fallback when no auth is configured
+pub async fn auth(
+    axum::extract::State(state): axum::extract::State<AuthState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    let effective_mode =
+        web_auth::effective_auth_mode(&state.auth_config, &state.legacy_api_key);
+
+    // Mode::None (no [auth] config and no legacy api_key) → loopback only.
+    if effective_mode == WebAuthMode::None {
+        let client_ip = web_auth::extract_client_ip(
+            request.headers(),
+            request.extensions(),
+            state.auth_config.trust_proxy_headers,
+        );
+
+        if !client_ip.is_loopback() {
+            tracing::warn!(
+                client_ip = %client_ip,
+                "Rejected non-localhost request: no auth configured. \
+                 Set api_key or [auth] mode in config.toml for remote access."
+            );
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "No authentication configured. Remote access denied. \
+                 Configure api_key or [auth] section in ~/.openfang/config.toml",
+            );
+        }
         return next.run(request).await;
     }
 
-    // Check Authorization: Bearer <token> header, then fallback to X-API-Key
-    let bearer_token = request
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-
-    let api_token = bearer_token.or_else(|| {
-        request
-            .headers()
-            .get("x-api-key")
-            .and_then(|v| v.to_str().ok())
-    });
-
-    // SECURITY: Use constant-time comparison to prevent timing attacks.
-    let header_auth = api_token.map(|token| {
-        use subtle::ConstantTimeEq;
-        if token.len() != api_key.len() {
-            return false;
-        }
-        token.as_bytes().ct_eq(api_key.as_bytes()).into()
-    });
-
-    // Also check ?token= query parameter (for EventSource/SSE clients that
-    // cannot set custom headers, same approach as WebSocket auth).
-    let query_token = request
-        .uri()
-        .query()
-        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")));
-
-    // SECURITY: Use constant-time comparison to prevent timing attacks.
-    let query_auth = query_token.map(|token| {
-        use subtle::ConstantTimeEq;
-        if token.len() != api_key.len() {
-            return false;
-        }
-        token.as_bytes().ct_eq(api_key.as_bytes()).into()
-    });
-
-    // Accept if either auth method matches
-    if header_auth == Some(true) || query_auth == Some(true) {
+    // Always-public endpoints
+    let path = request.uri().path();
+    if is_always_public(path) || is_a2a_endpoint(path) {
         return next.run(request).await;
     }
 
-    // Determine error message: was a credential provided but wrong, or missing entirely?
-    let credential_provided = header_auth.is_some() || query_auth.is_some();
-    let error_msg = if credential_provided {
-        "Invalid API key"
-    } else {
-        "Missing Authorization: Bearer <api_key> header"
-    };
+    // Dashboard-public endpoints (when protect_dashboard is false)
+    if !state.auth_config.protect_dashboard && is_dashboard_public(path) {
+        return next.run(request).await;
+    }
 
+    // --- Attempt authentication ---
+
+    // 1. Check session cookie (from password login)
+    if let Some(session_id) = web_auth::extract_session_cookie(request.headers()) {
+        if state.session_store.validate(&session_id) {
+            return next.run(request).await;
+        }
+    }
+
+    // 2. Extract token from headers or query parameter
+    let token = web_auth::extract_bearer_token(request.headers())
+        .or_else(|| web_auth::extract_api_key_header(request.headers()))
+        .or_else(|| web_auth::extract_query_token(request.uri()));
+
+    if let Some(token) = token {
+        // 2a. Check against legacy api_key (backwards compatible — existing behavior)
+        if !state.legacy_api_key.is_empty() && web_auth::constant_time_eq(token, &state.legacy_api_key) {
+            return next.run(request).await;
+        }
+
+        // 2b. Check against new multi-token config
+        if web_auth::validate_token(token, &state.auth_config).is_some() {
+            return next.run(request).await;
+        }
+
+        // Token was provided but invalid
+        return json_error(StatusCode::UNAUTHORIZED, "Invalid API token");
+    }
+
+    // No credentials provided
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
         .header("www-authenticate", "Bearer")
+        .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::json!({"error": error_msg}).to_string(),
+            serde_json::json!({
+                "error": "Authentication required. Provide Authorization: Bearer <token> header, or log in with password.",
+                "auth_mode": effective_mode.to_string()
+            })
+            .to_string(),
+        ))
+        .unwrap_or_default()
+}
+
+/// Helper to build a JSON error response.
+fn json_error(status: StatusCode, message: &str) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({"error": message}).to_string(),
         ))
         .unwrap_or_default()
 }
@@ -191,7 +222,6 @@ pub async fn security_headers(request: Request<Body>, next: Next) -> Response<Bo
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
     headers.insert("x-frame-options", "DENY".parse().unwrap());
     headers.insert("x-xss-protection", "1; mode=block".parse().unwrap());
-    // All JS/CSS is bundled inline — only external resource is Google Fonts.
     headers.insert(
         "content-security-policy",
         "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://localhost:* wss://127.0.0.1:*; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'"
@@ -216,5 +246,19 @@ mod tests {
     #[test]
     fn test_request_id_header_constant() {
         assert_eq!(REQUEST_ID_HEADER, "x-request-id");
+    }
+
+    #[test]
+    fn test_always_public_endpoints() {
+        assert!(is_always_public("/api/health"));
+        assert!(is_always_public("/api/version"));
+        assert!(is_always_public("/api/auth/login"));
+        assert!(!is_always_public("/api/agents"));
+    }
+
+    #[test]
+    fn test_a2a_endpoints() {
+        assert!(is_a2a_endpoint("/a2a/tasks/send"));
+        assert!(!is_a2a_endpoint("/api/a2a/agents"));
     }
 }

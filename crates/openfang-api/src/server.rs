@@ -42,6 +42,14 @@ pub async fn build_router(
     let bridge = channel_bridge::start_channel_bridge(kernel.clone()).await;
 
     let channels_config = kernel.config.channels.clone();
+    let session_store = Arc::new(crate::web_auth::SessionStore::new(
+        kernel.config.auth.session_timeout_secs,
+    ));
+    let login_limiter = Arc::new(crate::web_auth::LoginRateLimiter::new(
+        kernel.config.auth.max_login_attempts,
+        kernel.config.auth.login_lockout_secs,
+    ));
+
     let state = Arc::new(AppState {
         kernel: kernel.clone(),
         started_at: Instant::now(),
@@ -50,6 +58,8 @@ pub async fn build_router(
         channels_config: tokio::sync::RwLock::new(channels_config),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
+        session_store: session_store.clone(),
+        login_limiter,
     });
 
     // CORS: allow localhost origins by default. If API key is set, the API
@@ -96,13 +106,27 @@ pub async fn build_router(
                 origins.push(v);
             }
         }
+        // Add user-configured allowed origins (e.g., Cloudflare tunnel domains).
+        for origin in &state.kernel.config.auth.allowed_origins {
+            if let Ok(v) = origin.parse::<axum::http::HeaderValue>() {
+                origins.push(v);
+            } else {
+                tracing::warn!(origin = %origin, "Invalid allowed_origin in [auth] config, skipping");
+            }
+        }
         CorsLayer::new()
             .allow_origin(origins)
             .allow_methods(tower_http::cors::Any)
             .allow_headers(tower_http::cors::Any)
     };
 
-    let api_key = state.kernel.config.api_key.clone();
+    // Build auth state for the middleware — supports both new [auth] config
+    // and legacy api_key for backwards compatibility.
+    let auth_state = crate::middleware::AuthState {
+        auth_config: state.kernel.config.auth.clone(),
+        legacy_api_key: state.kernel.config.api_key.clone(),
+        session_store,
+    };
     let gcra_limiter = rate_limiter::create_rate_limiter();
 
     let app = Router::new()
@@ -669,8 +693,24 @@ pub async fn build_router(
             "/v1/models",
             axum::routing::get(crate::openai_compat::list_models),
         )
+        // Web authentication endpoints
+        .route("/api/auth/status", axum::routing::get(routes::auth_status))
+        .route("/api/auth/mode", axum::routing::get(routes::auth_mode))
+        .route("/api/auth/login", axum::routing::post(routes::auth_login))
+        .route("/api/auth/logout", axum::routing::post(routes::auth_logout))
+        .route(
+            "/api/auth/tokens",
+            axum::routing::get(routes::auth_list_tokens).post(routes::auth_create_token),
+        )
+        .route(
+            "/api/auth/tokens/{name}",
+            axum::routing::delete(routes::auth_revoke_token),
+        )
+        .route("/api/auth/sessions", axum::routing::get(routes::auth_list_sessions))
+        .route("/api/auth/password", axum::routing::put(routes::auth_set_password))
+        .route("/api/auth/check", axum::routing::get(routes::auth_check))
         .layer(axum::middleware::from_fn_with_state(
-            api_key,
+            auth_state,
             middleware::auth,
         ))
         .layer(axum::middleware::from_fn_with_state(

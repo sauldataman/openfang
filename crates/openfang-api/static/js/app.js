@@ -104,6 +104,7 @@ document.addEventListener('alpine:init', function() {
     focusMode: localStorage.getItem('openfang-focus') === 'true',
     showOnboarding: false,
     showAuthPrompt: false,
+    passwordLoginAvailable: false,
 
     toggleFocusMode() {
       this.focusMode = !this.focusMode;
@@ -154,17 +155,21 @@ document.addEventListener('alpine:init', function() {
     },
 
     async checkAuth() {
+      // Check auth mode to know if password login is available
       try {
-        // Use a protected endpoint (not in the public allowlist) to detect
-        // whether the server requires an API key.
+        var mode = await OpenFangAPI.get('/api/auth/mode');
+        if (mode && mode.password_login_available) {
+          this.passwordLoginAvailable = true;
+        }
+      } catch(e) { /* ignore */ }
+
+      try {
         await OpenFangAPI.get('/api/tools');
         this.showAuthPrompt = false;
       } catch(e) {
-        if (e.message && (e.message.indexOf('Not authorized') >= 0 || e.message.indexOf('401') >= 0 || e.message.indexOf('Missing Authorization') >= 0 || e.message.indexOf('Unauthorized') >= 0)) {
-          // Only show prompt if we don't already have a saved key
+        if (e.message && (e.message.indexOf('Not authorized') >= 0 || e.message.indexOf('401') >= 0 || e.message.indexOf('Missing Authorization') >= 0 || e.message.indexOf('Unauthorized') >= 0 || e.message.indexOf('Authentication required') >= 0)) {
           var saved = localStorage.getItem('openfang-api-key');
           if (saved) {
-            // Saved key might be stale — clear it and show prompt
             OpenFangAPI.setAuthToken('');
             localStorage.removeItem('openfang-api-key');
           }
@@ -179,6 +184,31 @@ document.addEventListener('alpine:init', function() {
       localStorage.setItem('openfang-api-key', key.trim());
       this.showAuthPrompt = false;
       this.refreshAgents();
+    },
+
+    async loginWithPassword(password, errorCallback) {
+      if (!password || !password.trim()) {
+        if (errorCallback) errorCallback('Password is required');
+        return;
+      }
+      try {
+        var result = await OpenFangAPI.post('/api/auth/login', { password: password.trim() });
+        if (result && result.ok) {
+          this.showAuthPrompt = false;
+          this.refreshAgents();
+        } else {
+          if (errorCallback) errorCallback((result && result.error) || 'Login failed');
+        }
+      } catch(e) {
+        var msg = 'Login failed';
+        try {
+          var body = JSON.parse(e.message || '{}');
+          if (body.error) msg = body.error;
+        } catch(_) {
+          if (e.message) msg = e.message;
+        }
+        if (errorCallback) errorCallback(msg);
+      }
     },
 
     clearApiKey() {

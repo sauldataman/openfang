@@ -77,6 +77,8 @@ async fn start_test_server_with_provider(
         channels_config: tokio::sync::RwLock::new(Default::default()),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
+        session_store: Arc::new(openfang_api::web_auth::SessionStore::new(86400)),
+        login_limiter: Arc::new(openfang_api::web_auth::LoginRateLimiter::new(5, 300)),
     });
 
     let app = Router::new()
@@ -696,6 +698,7 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
 
+    let session_store = Arc::new(openfang_api::web_auth::SessionStore::new(86400));
     let state = Arc::new(AppState {
         kernel,
         started_at: Instant::now(),
@@ -704,9 +707,15 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         channels_config: tokio::sync::RwLock::new(Default::default()),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
+        session_store: session_store.clone(),
+        login_limiter: Arc::new(openfang_api::web_auth::LoginRateLimiter::new(5, 300)),
     });
 
-    let api_key_state = state.kernel.config.api_key.clone();
+    let auth_state = openfang_api::middleware::AuthState {
+        auth_config: state.kernel.config.auth.clone(),
+        legacy_api_key: state.kernel.config.api_key.clone(),
+        session_store,
+    };
 
     let app = Router::new()
         .route("/api/health", axum::routing::get(routes::health))
@@ -750,7 +759,7 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         )
         .route("/api/shutdown", axum::routing::post(routes::shutdown))
         .layer(axum::middleware::from_fn_with_state(
-            api_key_state,
+            auth_state,
             middleware::auth,
         ))
         .layer(axum::middleware::from_fn(middleware::request_logging))
@@ -802,7 +811,9 @@ async fn test_auth_rejects_no_token() {
         .unwrap();
     assert_eq!(resp.status(), 401);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["error"].as_str().unwrap().contains("Missing"));
+    let err = body["error"].as_str().unwrap();
+    assert!(err.contains("Authentication required") || err.contains("Missing"),
+        "Expected auth error, got: {err}");
 }
 
 #[tokio::test]

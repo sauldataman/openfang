@@ -1045,6 +1045,9 @@ pub struct KernelConfig {
     /// OAuth client ID overrides for PKCE flows.
     #[serde(default)]
     pub oauth: OAuthConfig,
+    /// Web authentication configuration (multi-token, password login, sessions).
+    #[serde(default)]
+    pub auth: WebAuthConfig,
 }
 
 /// OAuth client ID overrides for PKCE flows.
@@ -1066,6 +1069,112 @@ pub struct OAuthConfig {
     pub microsoft_client_id: Option<String>,
     /// Slack OAuth client ID.
     pub slack_client_id: Option<String>,
+}
+
+/// Web authentication configuration — OpenClaw-inspired multi-method auth.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebAuthConfig {
+    /// Auth mode: "none", "token", "password", or "full".
+    pub mode: WebAuthMode,
+    /// Named API tokens for programmatic access.
+    pub tokens: Vec<WebAuthToken>,
+    /// Argon2-hashed password for web dashboard login.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub password_hash: String,
+    /// Auto-generate a token on first startup if none configured.
+    pub auto_generate_token: bool,
+    /// Session timeout in seconds (default: 24 hours).
+    pub session_timeout_secs: u64,
+    /// Require authentication for the dashboard HTML page itself.
+    pub protect_dashboard: bool,
+    /// Allowed CORS origins for remote access (e.g., Cloudflare tunnel domains).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_origins: Vec<String>,
+    /// Trust proxy headers (X-Forwarded-For, CF-Connecting-IP) for client IP detection.
+    #[serde(default)]
+    pub trust_proxy_headers: bool,
+    /// Set the Secure flag on session cookies (required for HTTPS / Cloudflare).
+    #[serde(default)]
+    pub secure_cookies: bool,
+    /// Maximum failed login attempts before lockout (0 = unlimited).
+    #[serde(default = "default_max_login_attempts")]
+    pub max_login_attempts: u32,
+    /// Lockout duration in seconds after max attempts exceeded.
+    #[serde(default = "default_login_lockout_secs")]
+    pub login_lockout_secs: u64,
+}
+
+fn default_max_login_attempts() -> u32 { 5 }
+fn default_login_lockout_secs() -> u64 { 300 }
+
+impl Default for WebAuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: WebAuthMode::None,
+            tokens: Vec::new(),
+            password_hash: String::new(),
+            auto_generate_token: true,
+            session_timeout_secs: 86400,
+            protect_dashboard: false,
+            allowed_origins: Vec::new(),
+            trust_proxy_headers: false,
+            secure_cookies: false,
+            max_login_attempts: default_max_login_attempts(),
+            login_lockout_secs: default_login_lockout_secs(),
+        }
+    }
+}
+
+impl std::fmt::Debug for WebAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebAuthConfig")
+            .field("mode", &self.mode)
+            .field("tokens", &format!("{} token(s)", self.tokens.len()))
+            .field("password_hash", &if self.password_hash.is_empty() { "<empty>" } else { "<redacted>" })
+            .field("protect_dashboard", &self.protect_dashboard)
+            .field("allowed_origins", &self.allowed_origins)
+            .field("trust_proxy_headers", &self.trust_proxy_headers)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebAuthMode {
+    #[default]
+    None,
+    Token,
+    Password,
+    Full,
+}
+
+impl std::fmt::Display for WebAuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "none"),
+            Self::Token => write!(f, "token"),
+            Self::Password => write!(f, "password"),
+            Self::Full => write!(f, "full"),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct WebAuthToken {
+    pub name: String,
+    pub token: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+impl std::fmt::Debug for WebAuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebAuthToken")
+            .field("name", &self.name)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Global spending budget configuration.
@@ -1212,6 +1321,7 @@ impl Default for KernelConfig {
             budget: BudgetConfig::default(),
             provider_urls: HashMap::new(),
             oauth: OAuthConfig::default(),
+            auth: WebAuthConfig::default(),
         }
     }
 }
